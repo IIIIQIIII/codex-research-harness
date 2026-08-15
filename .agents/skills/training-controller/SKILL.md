@@ -75,13 +75,20 @@ Continue observing. Poor intermediate metrics are evidence, not stop authority.
 
 ### REVIEW
 
-A predeclared review gate has been reached. Evaluate the run against criteria committed before seeing this gate's result.
+A predeclared review gate has been reached. Review is a two-phase protocol:
 
-A soft stop may be authorized only if its persistence and threshold requirements are satisfied.
+1. reach the gate and request review;
+2. evaluate the gate against the precommitted criterion;
+3. obtain the controller decision;
+4. finalize the gate in durable state before continuing.
+
+Do not put the active gate in `reviewed_gates` until its decision has been made. This prevents the current gate from being simultaneously treated as evaluated and pending.
+
+A soft stop may be authorized only if the active evaluated review plus prior finalized reviews satisfies its persistence and threshold requirements.
 
 ### INTERVENE
 
-A hard stop is active, or a soft stop is authorized at a review gate.
+A hard stop is active, or a soft stop is authorized at an evaluated review gate.
 
 Before changing route:
 
@@ -94,7 +101,7 @@ Before changing route:
 
 ### COMPLETE
 
-The planned completion horizon or explicit success condition is reached. Evaluate the run before starting another route.
+The planned completion horizon or explicit success condition is reached, and all reached review gates have been finalized. Evaluate the run before starting another route.
 
 ## Hard stops
 
@@ -115,10 +122,11 @@ Soft stops are scientific or economic judgments about a healthy run. Require all
 
 1. the minimum evidence horizon has passed;
 2. the run is at an eligible review gate;
-3. a precommitted failure criterion is met;
-4. the required number of consecutive failed reviews or other hysteresis condition is met.
+3. the current gate has been explicitly evaluated against a precommitted failure criterion;
+4. that criterion is bad at the current gate;
+5. the current result plus finalized prior reviews satisfies the required persistence / hysteresis condition.
 
-If a soft-stop hypothesis appears between gates, record it and continue to the next gate.
+If a soft-stop hypothesis appears between gates, record it and continue to the next gate. It does not become controller state until an eligible gate is actually evaluated.
 
 ## Hysteresis
 
@@ -126,9 +134,11 @@ Use persistence to prevent oscillation:
 
 ```text
 one bad signal -> update belief
-repeated bad review -> increase concern
-precommitted persistence threshold -> intervention may be authorized
+bad review -> stronger concern
+repeated bad review at eligible gate -> soft-stop authority
 ```
+
+Only finalized review gates contribute to the stored `consecutive_bad_reviews` count. The active gate is combined with that prior count during the review decision, then finalized afterward.
 
 After a material route change, apply a new protected window before considering another soft stop.
 
@@ -150,6 +160,8 @@ python scripts/trainctl.py evaluate \
   --state assets/state.example.json \
   --pretty
 ```
+
+At a review gate, use the two-phase flow documented in `references/policy-schema.md`: first receive `REVIEW_REQUIRED`, then populate `active_review`, then call the checker again to obtain `STOP_ALLOWED_SOFT` or `FINALIZE_REVIEW_CONTINUE`.
 
 The helper is intentionally advisory and side-effect free. It never launches, kills, signals, checkpoints, or edits a training job.
 

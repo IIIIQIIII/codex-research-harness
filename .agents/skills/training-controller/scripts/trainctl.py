@@ -54,19 +54,18 @@ def validate_policy(policy: dict[str, Any]) -> None:
 
 
 def validate_state(state: dict[str, Any], policy: dict[str, Any]) -> None:
-    _as_nonnegative_int(state.get("current_step"), "current_step")
+    current = _as_nonnegative_int(state.get("current_step"), "current_step")
     _as_nonnegative_int(state.get("consecutive_bad_reviews", 0), "consecutive_bad_reviews")
 
     reviewed = state.get("reviewed_gates", [])
     if not isinstance(reviewed, list):
         raise PolicyError("reviewed_gates must be a list")
-    reviewed_set = {_as_nonnegative_int(g, "reviewed_gates[]") for g in reviewed}
-    unknown = reviewed_set.difference(policy["review_gates"])
+    parsed_reviewed = [_as_nonnegative_int(g, "reviewed_gates[]") for g in reviewed]
+    if parsed_reviewed != sorted(set(parsed_reviewed)):
+        raise PolicyError("reviewed_gates must be strictly increasing and unique")
+    unknown = set(parsed_reviewed).difference(policy["review_gates"])
     if unknown:
         raise PolicyError(f"reviewed_gates contains values not present in policy: {sorted(unknown)}")
-
-    if not isinstance(state.get("soft_stop_requested", False), bool):
-        raise PolicyError("soft_stop_requested must be boolean")
 
     hard = state.get("hard_stop", {})
     if not isinstance(hard, dict):
@@ -76,6 +75,35 @@ def validate_state(state: dict[str, Any], policy: dict[str, Any]) -> None:
     reason = hard.get("reason", "")
     if reason is not None and not isinstance(reason, str):
         raise PolicyError("hard_stop.reason must be a string")
+
+    active = state.get("active_review")
+    if active is None:
+        return
+    if not isinstance(active, dict):
+        raise PolicyError("active_review must be null or an object")
+
+    gate = _as_nonnegative_int(active.get("gate"), "active_review.gate")
+    if gate not in policy["review_gates"]:
+        raise PolicyError("active_review.gate must be present in policy.review_gates")
+    if gate in parsed_reviewed:
+        raise PolicyError("active_review.gate cannot already be present in reviewed_gates")
+    if gate > current:
+        raise PolicyError("active_review.gate cannot be ahead of current_step")
+
+    evaluated = active.get("evaluated", False)
+    if not isinstance(evaluated, bool):
+        raise PolicyError("active_review.evaluated must be boolean")
+    if not isinstance(active.get("bad", False), bool):
+        raise PolicyError("active_review.bad must be boolean")
+    if not isinstance(active.get("soft_stop_requested", False), bool):
+        raise PolicyError("active_review.soft_stop_requested must be boolean")
+
+
+def _next_consecutive_bad_reviews(state: dict[str, Any]) -> int:
+    active = state["active_review"]
+    if active["bad"]:
+        return state.get("consecutive_bad_reviews", 0) + 1
+    return 0
 
 
 def evaluate(policy: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
@@ -106,31 +134,64 @@ def evaluate(policy: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
         }
 
     pending_reached = [g for g in gates if g <= current and g not in reviewed]
+    active = state.get("active_review")
+
     if pending_reached:
         gate = min(pending_reached)
-        required = policy.get("soft_stop", {}).get("required_consecutive_bad_reviews", 1)
-        bad_reviews = state.get("consecutive_bad_reviews", 0)
-        soft_requested = state.get("soft_stop_requested", False)
 
-        if soft_requested and bad_reviews >= required:
+        if active is None:
             return {
-                "action": "STOP_ALLOWED_SOFT",
-                "reason": "eligible review gate reached and soft-stop persistence requirement satisfied",
+                "action": "REVIEW_REQUIRED",
+                "reason": "an unreviewed review gate has been reached",
                 "current_step": current,
                 "review_gate": gate,
-                "consecutive_bad_reviews": bad_reviews,
-                "required_consecutive_bad_reviews": required,
+            }
+
+        if active["gate"] != gate:
+            raise PolicyError(
+                f"active_review.gate must match earliest pending reached gate {gate}"
+            )
+
+        if not active.get("evaluated", False):
+            return {
+                "action": "REVIEW_REQUIRED",
+                "reason": "the active review gate has not yet been evaluated",
+                "current_step": current,
+                "review_gate": gate,
+            }
+
+        next_bad_reviews = _next_consecutive_bad_reviews(state)
+        required = policy.get("soft_stop", {}).get("required_consecutive_bad_reviews", 1)
+        soft_requested = active.get("soft_stop_requested", False)
+
+        common = {
+            "current_step": current,
+            "review_gate": gate,
+            "review_bad": active["bad"],
+            "next_consecutive_bad_reviews": next_bad_reviews,
+            "required_consecutive_bad_reviews": required,
+            "finalize_review": {
+                "add_reviewed_gate": gate,
+                "set_consecutive_bad_reviews": next_bad_reviews,
+                "clear_active_review": True,
+            },
+        }
+
+        if active["bad"] and soft_requested and next_bad_reviews >= required:
+            return {
+                "action": "STOP_ALLOWED_SOFT",
+                "reason": "evaluated review gate satisfies the precommitted soft-stop persistence rule",
+                **common,
             }
 
         return {
-            "action": "REVIEW_REQUIRED",
-            "reason": "an unreviewed review gate has been reached",
-            "current_step": current,
-            "review_gate": gate,
-            "soft_stop_requested": soft_requested,
-            "consecutive_bad_reviews": bad_reviews,
-            "required_consecutive_bad_reviews": required,
+            "action": "FINALIZE_REVIEW_CONTINUE",
+            "reason": "review is evaluated but does not authorize a soft stop; record it before continuing",
+            **common,
         }
+
+    if active is not None:
+        raise PolicyError("active_review exists but no reached unreviewed gate is pending")
 
     completion = policy.get("completion_step")
     if completion is not None and current >= completion:
@@ -143,14 +204,6 @@ def evaluate(policy: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
 
     future_gates = [g for g in gates if g > current]
     next_gate = min(future_gates) if future_gates else None
-
-    if state.get("soft_stop_requested", False):
-        return {
-            "action": "CONTINUE_TO_NEXT_GATE",
-            "reason": "soft stop is requested but no eligible review gate currently authorizes it",
-            "current_step": current,
-            "next_review_gate": next_gate,
-        }
 
     return {
         "action": "CONTINUE_OBSERVE",
@@ -182,54 +235,107 @@ def self_test() -> None:
                 "current_step": 5,
                 "reviewed_gates": [],
                 "consecutive_bad_reviews": 0,
-                "soft_stop_requested": False,
+                "active_review": None,
                 "hard_stop": {"triggered": True, "reason": "persistent NaN"},
             },
             "STOP_NOW_HARD",
         ),
         (
-            "protected window blocks soft stop",
+            "protected window blocks review-driven stopping",
             {
                 "current_step": 10,
                 "reviewed_gates": [],
-                "consecutive_bad_reviews": 3,
-                "soft_stop_requested": True,
+                "consecutive_bad_reviews": 0,
+                "active_review": None,
                 "hard_stop": {"triggered": False, "reason": ""},
             },
             "CONTINUE_PROTECTED",
         ),
         (
-            "reached gate requires review",
+            "reached gate requires review before a decision",
             {
                 "current_step": 20,
                 "reviewed_gates": [],
-                "consecutive_bad_reviews": 1,
-                "soft_stop_requested": True,
+                "consecutive_bad_reviews": 0,
+                "active_review": None,
                 "hard_stop": {"triggered": False, "reason": ""},
             },
             "REVIEW_REQUIRED",
         ),
         (
-            "soft stop allowed only at gate with hysteresis",
+            "unevaluated active review still requires review",
+            {
+                "current_step": 20,
+                "reviewed_gates": [],
+                "consecutive_bad_reviews": 0,
+                "active_review": {
+                    "gate": 20,
+                    "evaluated": False,
+                    "bad": False,
+                    "soft_stop_requested": False,
+                },
+                "hard_stop": {"triggered": False, "reason": ""},
+            },
+            "REVIEW_REQUIRED",
+        ),
+        (
+            "natural second bad review authorizes soft stop",
             {
                 "current_step": 40,
                 "reviewed_gates": [20],
-                "consecutive_bad_reviews": 2,
-                "soft_stop_requested": True,
+                "consecutive_bad_reviews": 1,
+                "active_review": {
+                    "gate": 40,
+                    "evaluated": True,
+                    "bad": True,
+                    "soft_stop_requested": True,
+                },
                 "hard_stop": {"triggered": False, "reason": ""},
             },
             "STOP_ALLOWED_SOFT",
         ),
         (
-            "between gates soft stop must wait",
+            "first bad review must be finalized and continued",
+            {
+                "current_step": 20,
+                "reviewed_gates": [],
+                "consecutive_bad_reviews": 0,
+                "active_review": {
+                    "gate": 20,
+                    "evaluated": True,
+                    "bad": True,
+                    "soft_stop_requested": True,
+                },
+                "hard_stop": {"triggered": False, "reason": ""},
+            },
+            "FINALIZE_REVIEW_CONTINUE",
+        ),
+        (
+            "good review resets bad-review persistence",
+            {
+                "current_step": 40,
+                "reviewed_gates": [20],
+                "consecutive_bad_reviews": 1,
+                "active_review": {
+                    "gate": 40,
+                    "evaluated": True,
+                    "bad": False,
+                    "soft_stop_requested": False,
+                },
+                "hard_stop": {"triggered": False, "reason": ""},
+            },
+            "FINALIZE_REVIEW_CONTINUE",
+        ),
+        (
+            "between finalized gates continue observing",
             {
                 "current_step": 30,
                 "reviewed_gates": [20],
-                "consecutive_bad_reviews": 2,
-                "soft_stop_requested": True,
+                "consecutive_bad_reviews": 1,
+                "active_review": None,
                 "hard_stop": {"triggered": False, "reason": ""},
             },
-            "CONTINUE_TO_NEXT_GATE",
+            "CONTINUE_OBSERVE",
         ),
         (
             "completion waits for final review",
@@ -237,18 +343,34 @@ def self_test() -> None:
                 "current_step": 60,
                 "reviewed_gates": [20, 40],
                 "consecutive_bad_reviews": 0,
-                "soft_stop_requested": False,
+                "active_review": None,
                 "hard_stop": {"triggered": False, "reason": ""},
             },
             "REVIEW_REQUIRED",
         ),
         (
-            "complete after final review",
+            "final review must be finalized before completion",
+            {
+                "current_step": 60,
+                "reviewed_gates": [20, 40],
+                "consecutive_bad_reviews": 0,
+                "active_review": {
+                    "gate": 60,
+                    "evaluated": True,
+                    "bad": False,
+                    "soft_stop_requested": False,
+                },
+                "hard_stop": {"triggered": False, "reason": ""},
+            },
+            "FINALIZE_REVIEW_CONTINUE",
+        ),
+        (
+            "complete after final review is finalized",
             {
                 "current_step": 60,
                 "reviewed_gates": [20, 40, 60],
                 "consecutive_bad_reviews": 0,
-                "soft_stop_requested": False,
+                "active_review": None,
                 "hard_stop": {"triggered": False, "reason": ""},
             },
             "COMPLETE",
@@ -258,6 +380,40 @@ def self_test() -> None:
     for name, state, expected in cases:
         actual = evaluate(policy, state)["action"]
         assert actual == expected, f"{name}: expected {expected}, got {actual}"
+
+    first_bad = evaluate(
+        policy,
+        {
+            "current_step": 20,
+            "reviewed_gates": [],
+            "consecutive_bad_reviews": 0,
+            "active_review": {
+                "gate": 20,
+                "evaluated": True,
+                "bad": True,
+                "soft_stop_requested": True,
+            },
+            "hard_stop": {"triggered": False, "reason": ""},
+        },
+    )
+    assert first_bad["next_consecutive_bad_reviews"] == 1
+
+    good_review = evaluate(
+        policy,
+        {
+            "current_step": 40,
+            "reviewed_gates": [20],
+            "consecutive_bad_reviews": 1,
+            "active_review": {
+                "gate": 40,
+                "evaluated": True,
+                "bad": False,
+                "soft_stop_requested": False,
+            },
+            "hard_stop": {"triggered": False, "reason": ""},
+        },
+    )
+    assert good_review["next_consecutive_bad_reviews"] == 0
 
     print(f"ok: {len(cases)} trainctl policy checks passed")
 
