@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+
+# Runtime research state when testing the harness in this repo
+.research/session/
+.research/runs/*/logs/
+.research/runs/*/checkpoints/
+reports/
+logs/
