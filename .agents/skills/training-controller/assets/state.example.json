@@ -1,0 +1,10 @@
+{
+  "current_step": 12000,
+  "reviewed_gates": [],
+  "consecutive_bad_reviews": 0,
+  "soft_stop_requested": false,
+  "hard_stop": {
+    "triggered": false,
+    "reason": ""
+  }
+}

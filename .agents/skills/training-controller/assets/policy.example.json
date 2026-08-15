@@ -1,0 +1,8 @@
+{
+  "minimum_evidence_step": 20000,
+  "review_gates": [20000, 40000, 60000, 80000],
+  "completion_step": 80000,
+  "soft_stop": {
+    "required_consecutive_bad_reviews": 2
+  }
+}
